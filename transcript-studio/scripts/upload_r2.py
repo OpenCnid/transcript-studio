@@ -26,6 +26,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# Load .env from workdir (via _common's auto-loader)
+try:
+    from . import _common as _  # noqa: F401 — triggers .env load
+except ImportError:
+    try:
+        import _common as _  # noqa: F401 — direct script invocation
+    except ImportError:
+        pass  # standalone usage without _common
+
 try:
     import boto3
     from botocore.config import Config as BotoConfig
