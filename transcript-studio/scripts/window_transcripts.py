@@ -1,0 +1,1 @@
+../../content-scout/scripts/window_transcripts.py

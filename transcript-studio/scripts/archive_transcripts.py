@@ -1,0 +1,1 @@
+../../content-scout/scripts/archive_transcripts.py

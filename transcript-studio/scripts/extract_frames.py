@@ -1,0 +1,1 @@
+../../content-scout/scripts/extract_frames.py

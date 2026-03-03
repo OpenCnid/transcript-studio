@@ -1,0 +1,1 @@
+../../content-scout/scripts/update_log.py

@@ -1,0 +1,1 @@
+../../content-scout/scripts/cleanup_tmp.py

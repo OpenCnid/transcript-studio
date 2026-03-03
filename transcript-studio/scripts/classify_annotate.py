@@ -1,0 +1,1 @@
+../../content-scout/scripts/classify_annotate.py
