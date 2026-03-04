@@ -73,6 +73,11 @@ def parse_args() -> argparse.Namespace:
         choices=["default", "podcast", "presentation", "suno"],
         help="Optional preset override applied to all videos",
     )
+    parser.add_argument(
+        "--domain",
+        default="finance",
+        help="Analysis domain — passed to summarize and export steps (default: finance)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print steps without executing")
     parser.add_argument("--force", action="store_true", help="Ignore previous state and rerun all steps")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logs")
@@ -576,6 +581,7 @@ def run_per_video_step(
     verbose: bool,
     dry_run: bool,
     image_base_url: str = "",
+    domain: str = "finance",
 ) -> tuple[int, str]:
     if not videos:
         return 0, "no videos selected"
@@ -612,6 +618,8 @@ def run_per_video_step(
                 "tmp/annotations.json",
                 "--output",
                 f"tmp/ts_{video_id}_summary.json",
+                "--domain",
+                domain,
             ]
         elif step.name == "export":
             args = [
@@ -621,6 +629,8 @@ def run_per_video_step(
                 f"tmp/ts_{video_id}_merged.json",
                 "--summary",
                 f"tmp/ts_{video_id}_summary.json",
+                "--domain",
+                domain,
             ]
             if image_base_url:
                 args.extend(["--image-base-url", image_base_url])
@@ -750,6 +760,7 @@ def main() -> int:
                 code, message = run_per_video_step(
                     step, videos, args.preset, args.verbose, args.dry_run,
                     image_base_url=image_base_url,
+                    domain=args.domain or "finance",
                 )
         else:
             step_args = build_step_args(step.name, pipeline_date, active_preset)

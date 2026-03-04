@@ -50,6 +50,11 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional URL prefix for visual image_path values (external Notion image embeds)",
     )
+    parser.add_argument(
+        "--domain",
+        default="finance",
+        help="Analysis domain — controls which analysis section to render (default: finance)",
+    )
     parser.add_argument("--delay", type=float, default=0.35, help="Rate limit delay between API calls")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logs")
     return parser.parse_args()
@@ -604,6 +609,169 @@ def build_signal_extraction_blocks(summary_payload: dict[str, Any]) -> list[dict
     return blocks
 
 
+def build_tool_analysis_blocks(summary_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build the 🤖 Tool Analysis section for non-finance domains (openclaw, etc.)."""
+    analysis = summary_payload.get("tool_analysis")
+    if not isinstance(analysis, dict):
+        return []
+
+    blocks: list[dict[str, Any]] = []
+
+    # ── Section heading ──
+    blocks.append(heading_block(1, "🤖 Tool Analysis"))
+
+    # ── Quick Verdict ──
+    verdict = normalize_text(analysis.get("quick_verdict"), "No analysis available.")
+    blocks.append(callout_block(verdict, emoji="🎯"))
+
+    # ── Presenter Assessment ──
+    assessment = normalize_text(analysis.get("presenter_assessment"))
+    if assessment and assessment != "No assessment available.":
+        blocks.append(callout_block(assessment, emoji="🔍"))
+
+    # ── Scores Dashboard ──
+    scores = analysis.get("scores") or {}
+    score_parts = [
+        f"Useful: {score_bar(scores.get('usefulness', 0))} {scores.get('usefulness', 0)}",
+        f"Setup: {score_bar(scores.get('ease_of_setup', 0))} {scores.get('ease_of_setup', 0)}",
+        f"Docs: {score_bar(scores.get('documentation_quality', 0))} {scores.get('documentation_quality', 0)}",
+        f"Beginner: {score_bar(scores.get('beginner_friendly', 0))} {scores.get('beginner_friendly', 0)}",
+        f"Prod-Ready: {score_bar(scores.get('production_ready', 0))} {scores.get('production_ready', 0)}",
+    ]
+    blocks.append(callout_block(" · ".join(score_parts), emoji="📊"))
+
+    # ── Setup Complexity ──
+    complexity = analysis.get("complexity") or {}
+    blocks.append(heading_block(3, "Setup Complexity"))
+    blocks.append(
+        bulleted_list_item_block(
+            f"Difficulty: {normalize_text(complexity.get('setup_difficulty'), '—')}"
+        )
+    )
+    blocks.append(
+        bulleted_list_item_block(
+            f"Time to Setup: {normalize_text(complexity.get('time_to_setup'), '—')}"
+        )
+    )
+    blocks.append(
+        bulleted_list_item_block(
+            f"Technical Level: {normalize_text(complexity.get('technical_level'), '—')}"
+        )
+    )
+    prereqs = complexity.get("prerequisites") or []
+    if isinstance(prereqs, list) and prereqs:
+        prereq_text = ", ".join(str(p).strip() for p in prereqs if str(p).strip())
+        if prereq_text:
+            blocks.append(bulleted_list_item_block(f"Prerequisites: {prereq_text}"))
+    else:
+        blocks.append(bulleted_list_item_block("Prerequisites: None noted"))
+    failure_points = complexity.get("failure_points") or []
+    if isinstance(failure_points, list) and failure_points:
+        fp_text = "; ".join(str(f).strip() for f in failure_points if str(f).strip())
+        if fp_text:
+            blocks.append(bulleted_list_item_block(f"⚠️ Likely Failure Points: {fp_text}"))
+
+    # ── Features Covered ──
+    features = analysis.get("features_covered") or []
+    blocks.append(heading_block(3, "Features Covered"))
+    if not features:
+        blocks.append(paragraph_block("No specific features identified in this video."))
+    else:
+        evidence_icons = {
+            "live_demo": "🟢 Live",
+            "output_shown": "🔵 Output",
+            "described": "🟡 Described",
+            "mentioned": "🟠 Mentioned",
+            "claimed": "🔴 Claimed",
+        }
+        feature_rows: list[list[str]] = []
+        for f in features:
+            if not isinstance(f, dict):
+                continue
+            ev = normalize_text(f.get("evidence_level"), "described")
+            ev_label = evidence_icons.get(ev, f"⚪ {ev}")
+            pv = int(f.get("practical_value", 0))
+            feature_rows.append(
+                [
+                    normalize_text(f.get("feature"), "—"),
+                    normalize_text(f.get("description"), "—"),
+                    ev_label,
+                    score_bar(pv, 5),
+                    normalize_text(f.get("timestamp"), "—"),
+                ]
+            )
+        if feature_rows:
+            header = table_row_block(["Feature", "Description", "Evidence", "Value", "Time"])
+            data_rows = [table_row_block(row) for row in feature_rows]
+            blocks.append(
+                {
+                    "object": "block",
+                    "type": "table",
+                    "table": {
+                        "table_width": 5,
+                        "has_column_header": True,
+                        "children": [header] + data_rows,
+                    },
+                }
+            )
+
+    # ── Use Cases ──
+    use_cases = analysis.get("use_cases") or []
+    blocks.append(heading_block(3, "Use Cases"))
+    if not use_cases:
+        blocks.append(paragraph_block("No specific use cases identified."))
+    else:
+        for uc in use_cases:
+            text = normalize_text(uc)
+            if text:
+                blocks.append(bulleted_list_item_block(text))
+
+    # ── Integration Points ──
+    integrations = analysis.get("integration_points") or []
+    blocks.append(heading_block(3, "Integration Points"))
+    if not integrations:
+        blocks.append(paragraph_block("No integration points identified."))
+    else:
+        for ip in integrations:
+            text = normalize_text(ip)
+            if text:
+                blocks.append(bulleted_list_item_block(text))
+
+    # ── Limitations ──
+    limitations = analysis.get("limitations") or []
+    blocks.append(heading_block(3, "Limitations"))
+    if not limitations:
+        blocks.append(paragraph_block("No limitations noted."))
+    else:
+        for lim in limitations:
+            text = normalize_text(lim)
+            if text:
+                blocks.append(bulleted_list_item_block(text))
+
+    # ── Alternatives ──
+    alternatives = analysis.get("alternatives") or []
+    if alternatives:
+        blocks.append(heading_block(3, "Alternatives"))
+        for alt in alternatives:
+            text = normalize_text(alt)
+            if text:
+                blocks.append(bulleted_list_item_block(text))
+
+    # ── Red Flags ──
+    red_flags = analysis.get("red_flags") or []
+    if red_flags:
+        blocks.append(heading_block(3, "🚩 Red Flags"))
+        for rf in red_flags:
+            text = normalize_text(rf)
+            if text:
+                blocks.append(bulleted_list_item_block(text))
+
+    # ── Divider to separate analysis from content ──
+    blocks.append(divider_block())
+
+    return blocks
+
+
 def summary_takeaway_blocks(summary_payload: dict[str, Any]) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
     raw_takeaways = summary_payload.get("takeaways", [])
@@ -1119,12 +1287,16 @@ def build_page_blocks(
     merged_payload: list[dict[str, Any]],
     summary_payload: dict[str, Any],
     image_base_url: str,
+    domain: str = "finance",
 ) -> list[dict[str, Any]]:
     segments = normalize_segments(transcript_payload)
     metadata = build_page_metadata(transcript_payload, segments)
 
     blocks: list[dict[str, Any]] = [build_metadata_callout(metadata)]
-    blocks.extend(build_signal_extraction_blocks(summary_payload))
+    if domain == "finance":
+        blocks.extend(build_signal_extraction_blocks(summary_payload))
+    else:
+        blocks.extend(build_tool_analysis_blocks(summary_payload))
     blocks.extend(build_tldr(summary_payload))
     blocks.extend(build_summary_blocks(summary_payload))
 
@@ -1205,6 +1377,7 @@ def main() -> int:
                 merged_payload=merged_payload,
                 summary_payload=summary_payload,
                 image_base_url=args.image_base_url,
+                domain=args.domain or "finance",
             )
             append_failures = append_blocks(notion, page_id, blocks, args.delay)
             if append_failures:

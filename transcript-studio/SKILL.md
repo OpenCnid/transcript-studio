@@ -50,10 +50,15 @@ messages, and whether `--force` or manual intervention is needed.
 ## Quick Start
 
 ```bash
-# Process a single video (full pipeline)
+# Process a single video (full pipeline, default finance domain)
 python3 scripts/run_transcript_pipeline.py \
   --video-url "https://youtube.com/watch?v=VIDEO_ID" \
   --preset default
+
+# Process a video with a different analysis domain
+python3 scripts/run_transcript_pipeline.py \
+  --video-url "https://youtube.com/watch?v=VIDEO_ID" \
+  --domain openclaw
 
 # Process latest from monitored channels
 python3 scripts/run_transcript_pipeline.py --date 2026-02-24
@@ -84,6 +89,35 @@ python3 scripts/run_transcript_pipeline.py --date 2026-02-24
 
 Steps marked *(content-scout)* require the content-scout skill's scripts on `sys.path`
 or in the same scripts directory.
+
+## Domains
+
+Domains control the **analysis persona, output schema, and Notion page layout** via the
+`--domain` flag. All other pipeline steps (download, transcribe, frames, etc.) are shared.
+
+If the user specifies a domain (e.g. "in finance", "in openclaw", "analyze this as an
+OpenClaw video"), pass `--domain <name>`. Default: `finance`.
+
+| Domain | Persona | Analysis Section | Best for |
+|--------|---------|-----------------|----------|
+| `finance` | Macro strategist | 🔥 Signal Extraction Layer (tickers, macro, scores) | Stock/market videos |
+| `openclaw` | AI systems architect | 🤖 Tool Analysis (features, setup, scores) | AI tool/framework videos |
+
+Domain prompt files live in `prompts/{domain}/`:
+
+```
+prompts/
+  finance/
+    persona.md          ← System prompt (analyst persona)
+    instructions.md     ← Output JSON schema + requirements
+  openclaw/
+    persona.md          ← System prompt (AI tools evaluator)
+    instructions.md     ← Output JSON schema + requirements
+```
+
+**Adding a new domain:** Copy an existing domain folder, edit the markdown files to define
+the new persona and output schema, and use `--domain <name>` to activate it. No Python
+code changes required unless the Notion page needs a custom analysis section layout.
 
 ## Presets
 

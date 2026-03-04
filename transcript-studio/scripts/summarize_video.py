@@ -23,6 +23,42 @@ DEFAULT_MODELS = {
 JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 EXCLUDED_CATEGORIES = {"TALKING_HEAD", "FILLER"}
 
+
+def skill_root() -> Path:
+    """Return the transcript-studio skill root directory."""
+    return Path(__file__).resolve().parent.parent
+
+
+def load_domain_prompts(domain: str) -> tuple[str, str]:
+    """Load persona and instructions from prompts/{domain}/ directory.
+
+    Falls back to hardcoded ANALYST_PERSONA/TASK_INSTRUCTIONS for 'finance' domain
+    if prompt files don't exist.
+    """
+    prompts_dir = skill_root() / "prompts" / domain
+    persona_path = prompts_dir / "persona.md"
+    instructions_path = prompts_dir / "instructions.md"
+
+    if persona_path.exists() and instructions_path.exists():
+        return (
+            persona_path.read_text(encoding="utf-8").strip(),
+            instructions_path.read_text(encoding="utf-8").strip(),
+        )
+
+    if domain == "finance":
+        LOGGER.warning("Finance prompt files not found at %s, using hardcoded defaults", prompts_dir)
+        return ANALYST_PERSONA, TASK_INSTRUCTIONS
+
+    available = []
+    prompts_root = skill_root() / "prompts"
+    if prompts_root.exists():
+        available = [d.name for d in prompts_root.iterdir() if d.is_dir()]
+    raise ContentScoutError(
+        f"Domain prompt files not found: {prompts_dir}. "
+        f"Available domains: {', '.join(available) if available else 'none'}"
+    )
+
+
 ANALYST_PERSONA = """You are a 30-year veteran macro strategist and options trader serving as senior analyst \
 for a financial media production team. You've done sell-side research at top-tier banks, ran a macro fund \
 through dot-com, GFC, Euro crisis, COVID, and the AI capex super-cycle. Now you screen financial video \
@@ -178,6 +214,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, help="Path to write summary.json")
     parser.add_argument("--provider", choices=["anthropic", "openai", "auto"], default="auto")
     parser.add_argument("--model", default=None, help="Model name (default: provider-specific)")
+    parser.add_argument(
+        "--domain",
+        default="finance",
+        help="Analysis domain — loads prompts from prompts/{domain}/ (default: finance)",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logs")
     return parser.parse_args()
 
@@ -363,17 +404,19 @@ def build_prompt(
     metadata: dict[str, Any],
     segments: list[dict[str, Any]],
     visual_annotations: list[dict[str, Any]],
+    instructions: str = "",
 ) -> str:
     """Build the user-message prompt (task instructions + data).
 
-    The analyst persona (ANALYST_PERSONA) is sent separately as a system message.
+    The analyst persona is sent separately as a system message.
     """
+    task_instructions = instructions or TASK_INSTRUCTIONS
     payload = {
         "video": metadata,
         "transcript_segments": compact_transcript_segments(segments),
         "visual_annotations": visual_annotations,
     }
-    return f"{TASK_INSTRUCTIONS}\n\nINPUT_DATA_JSON:\n{json.dumps(payload, ensure_ascii=False)}"
+    return f"{task_instructions}\n\nINPUT_DATA_JSON:\n{json.dumps(payload, ensure_ascii=False)}"
 
 
 def call_anthropic(system_prompt: str, user_prompt: str, model: str) -> str:
@@ -760,7 +803,145 @@ def normalize_signal_extraction(value: Any) -> dict[str, Any]:
     }
 
 
-def normalize_summary(payload: dict[str, Any]) -> dict[str, Any]:
+# ── Tool Analysis normalizers (openclaw + general tool domains) ────────────
+
+
+VALID_SETUP_DIFFICULTIES = {"Easy", "Medium", "Hard", "Expert"}
+VALID_TECHNICAL_LEVELS = {"Beginner", "Intermediate", "Advanced", "Expert"}
+
+
+def normalize_complexity(value: Any) -> dict[str, Any]:
+    """Normalize the complexity sub-object for tool analysis."""
+    if not isinstance(value, dict):
+        return {
+            "setup_difficulty": "Medium",
+            "time_to_setup": "Unknown",
+            "prerequisites": [],
+            "technical_level": "Intermediate",
+            "failure_points": [],
+        }
+
+    difficulty = str(value.get("setup_difficulty") or "Medium").strip()
+    if difficulty not in VALID_SETUP_DIFFICULTIES:
+        difficulty = "Medium"
+
+    level = str(value.get("technical_level") or "Intermediate").strip()
+    if level not in VALID_TECHNICAL_LEVELS:
+        level = "Intermediate"
+
+    prereqs = value.get("prerequisites", [])
+    if not isinstance(prereqs, list):
+        prereqs = []
+    prereqs = [str(p).strip() for p in prereqs if str(p).strip()]
+
+    failure_points = value.get("failure_points", [])
+    if not isinstance(failure_points, list):
+        failure_points = []
+    failure_points = [str(f).strip() for f in failure_points if str(f).strip()]
+
+    return {
+        "setup_difficulty": difficulty,
+        "time_to_setup": str(value.get("time_to_setup") or "Unknown").strip(),
+        "prerequisites": prereqs,
+        "technical_level": level,
+        "failure_points": failure_points,
+    }
+
+
+VALID_EVIDENCE_LEVELS = {"live_demo", "output_shown", "described", "mentioned", "claimed"}
+
+
+def normalize_features_covered(value: Any) -> list[dict[str, Any]]:
+    """Normalize the features_covered array for tool analysis."""
+    if not isinstance(value, list):
+        return []
+    features: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("feature") or "").strip()
+        if not name:
+            continue
+        seconds = derive_seconds(item, ["timestamp_seconds", "seconds"], ["timestamp"])
+        practical_value = coerce_int(item.get("practical_value"))
+        if practical_value is None or practical_value < 0 or practical_value > 5:
+            practical_value = 1
+
+        # Support both evidence_level (new) and demonstrated (legacy boolean)
+        evidence_level = str(item.get("evidence_level") or "").strip().lower()
+        if evidence_level not in VALID_EVIDENCE_LEVELS:
+            # Fall back from boolean demonstrated field
+            if item.get("demonstrated") is False:
+                evidence_level = "mentioned"
+            else:
+                evidence_level = "described"
+
+        features.append(
+            {
+                "feature": name,
+                "description": str(item.get("description") or "").strip(),
+                "evidence_level": evidence_level,
+                "timestamp": format_timestamp(seconds),
+                "timestamp_seconds": seconds,
+                "practical_value": practical_value,
+            }
+        )
+    features.sort(key=lambda f: f["timestamp_seconds"])
+    return features
+
+
+def normalize_string_list(value: Any) -> list[str]:
+    """Normalize a list of plain strings."""
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def normalize_tool_scores(value: Any) -> dict[str, int]:
+    """Normalize the scores sub-object for tool analysis."""
+    if not isinstance(value, dict):
+        return {
+            "usefulness": 0,
+            "ease_of_setup": 0,
+            "documentation_quality": 0,
+            "beginner_friendly": 0,
+            "production_ready": 0,
+        }
+    scores: dict[str, int] = {}
+    for key in (
+        "usefulness",
+        "ease_of_setup",
+        "documentation_quality",
+        "beginner_friendly",
+        "production_ready",
+    ):
+        raw = coerce_int(value.get(key))
+        scores[key] = max(0, min(5, raw)) if raw is not None else 0
+    return scores
+
+
+def normalize_tool_analysis(value: Any) -> dict[str, Any]:
+    """Normalize the full tool_analysis block."""
+    if not isinstance(value, dict):
+        value = {}
+
+    return {
+        "quick_verdict": str(value.get("quick_verdict") or "No analysis available.").strip(),
+        "presenter_assessment": str(
+            value.get("presenter_assessment") or "No assessment available."
+        ).strip(),
+        "complexity": normalize_complexity(value.get("complexity")),
+        "features_covered": normalize_features_covered(value.get("features_covered")),
+        "use_cases": normalize_string_list(value.get("use_cases")),
+        "integration_points": normalize_string_list(value.get("integration_points")),
+        "limitations": normalize_string_list(value.get("limitations")),
+        "alternatives": normalize_string_list(value.get("alternatives")),
+        "red_flags": normalize_string_list(value.get("red_flags")),
+        "scores": normalize_tool_scores(value.get("scores")),
+    }
+
+
+def normalize_summary(payload: dict[str, Any], domain: str = "finance") -> dict[str, Any]:
     takeaways = normalize_takeaways(payload.get("takeaways"))
     chapters = normalize_chapters(payload.get("chapters"))
     shorts = normalize_shorts(payload.get("shorts"))
@@ -773,13 +954,22 @@ def normalize_summary(payload: dict[str, Any]) -> dict[str, Any]:
     if shorts and len(shorts) < 10:
         LOGGER.warning("Model returned %d shorts (expected 10-14)", len(shorts))
 
-    return {
-        "signal_extraction": normalize_signal_extraction(payload.get("signal_extraction")),
+    result: dict[str, Any] = {
+        "domain": domain,
         "takeaways": takeaways,
         "chapters": chapters,
         "shorts": shorts,
         "slide_suggestions": slide_suggestions,
     }
+
+    if domain == "finance":
+        result["signal_extraction"] = normalize_signal_extraction(
+            payload.get("signal_extraction")
+        )
+    else:
+        result["tool_analysis"] = normalize_tool_analysis(payload.get("tool_analysis"))
+
+    return result
 
 
 def main() -> int:
@@ -804,17 +994,20 @@ def main() -> int:
         ).strip()
         visual_annotations = normalize_annotations(annotations_payload, video_id=video_id)
 
+        domain = args.domain or "finance"
+        persona, instructions = load_domain_prompts(domain)
+
         metadata = transcript_metadata(transcript_payload, transcript_path, segments)
-        prompt = build_prompt(metadata, segments, visual_annotations)
+        prompt = build_prompt(metadata, segments, visual_annotations, instructions=instructions)
 
         provider = detect_provider(args.provider)
         model = args.model or DEFAULT_MODELS[provider]
-        LOGGER.info("Using provider=%s model=%s", provider, model)
+        LOGGER.info("Using provider=%s model=%s domain=%s", provider, model, domain)
 
         call_fn = call_anthropic if provider == "anthropic" else call_openai
-        raw_response = call_fn(ANALYST_PERSONA, prompt, model)
+        raw_response = call_fn(persona, prompt, model)
         parsed = parse_json_object(raw_response)
-        summary = normalize_summary(parsed)
+        summary = normalize_summary(parsed, domain=domain)
 
         save_json(output_path, summary)
         LOGGER.info(
