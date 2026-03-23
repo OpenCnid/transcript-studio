@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Transcribe downloaded audio files with local mlx-whisper and OpenAI fallback."""
+"""Transcribe downloaded audio files via OpenAI API (default) or local mlx-whisper."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from _common import ensure_dir, load_json, resolve_path, run_command, save_json,
 LOGGER = logging.getLogger("content_scout.transcribe_local")
 
 DEFAULT_MLX_MODEL = "large-v3"
-DEFAULT_OPENAI_MODEL = "whisper-1"
+DEFAULT_OPENAI_MODEL = "gpt-4o-transcribe-diarize"
 PYANNOTE_MODEL = "pyannote/speaker-diarization-3.1"
 
 MLX_MODEL_ALIASES: dict[str, str] = {
@@ -185,16 +185,18 @@ def detect_engine(requested_engine: str) -> str:
             raise RuntimeError("OPENAI_API_KEY is required when --engine=openai")
         return "openai"
 
+    # Prefer OpenAI API (faster, supports diarization) over local mlx
+    if os.environ.get("OPENAI_API_KEY"):
+        return "openai"
+
     try:
         import mlx_whisper  # noqa: F401
 
         return "mlx"
     except Exception:  # noqa: BLE001
-        if os.environ.get("OPENAI_API_KEY"):
-            return "openai"
         raise RuntimeError(
-            "Could not auto-detect transcription engine. Install mlx-whisper "
-            "or set OPENAI_API_KEY for OpenAI fallback."
+            "Could not auto-detect transcription engine. Set OPENAI_API_KEY "
+            "for OpenAI (recommended) or install mlx-whisper for local inference."
         ) from None
 
 
@@ -205,6 +207,7 @@ def resolve_model(engine: str, model_arg: str | None) -> str:
         if engine == "openai" and model in MLX_MODEL_ALIASES:
             LOGGER.info("Remapping mlx model '%s' to '%s' for OpenAI engine", model, DEFAULT_OPENAI_MODEL)
             return DEFAULT_OPENAI_MODEL
+        # Accept explicit OpenAI model names (gpt-4o-transcribe, whisper-1, etc.)
         return model
     if engine == "mlx":
         return DEFAULT_MLX_MODEL
@@ -252,17 +255,67 @@ def build_openai_client() -> Any:
     return OpenAI()
 
 
+def _is_diarize_model(model: str) -> bool:
+    return "diarize" in model.lower()
+
+
+def _normalize_diarize_segments(raw_segments: list[Any]) -> list[dict[str, Any]]:
+    """Normalize segments from gpt-4o-transcribe-diarize (diarized_json format).
+
+    Each segment has: speaker, text, start, end.
+    """
+    normalized: list[dict[str, Any]] = []
+    for seg in raw_segments:
+        if not isinstance(seg, dict):
+            try:
+                seg = to_dict(seg)
+            except Exception:  # noqa: BLE001
+                continue
+        text = str(seg.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            start = float(seg.get("start", 0.0))
+            end = float(seg.get("end", start))
+        except (TypeError, ValueError):
+            continue
+        entry: dict[str, Any] = {
+            "start": max(0.0, start),
+            "end": max(max(0.0, start), end),
+            "text": text,
+        }
+        speaker = seg.get("speaker")
+        if speaker is not None:
+            entry["speaker"] = str(speaker)
+        normalized.append(entry)
+    return normalized
+
+
 def transcribe_openai_chunk(client: Any, file_path: Path, model: str) -> dict[str, Any]:
+    is_diarize = _is_diarize_model(model)
+
+    create_kwargs: dict[str, Any] = {
+        "model": model,
+    }
+
+    if is_diarize:
+        create_kwargs["response_format"] = "diarized_json"
+        create_kwargs["chunking_strategy"] = "auto"
+    else:
+        create_kwargs["response_format"] = "verbose_json"
+        create_kwargs["timestamp_granularities"] = ["segment"]
+
     with file_path.open("rb") as audio_handle:
-        response = client.audio.transcriptions.create(
-            model=model,
-            file=audio_handle,
-            response_format="verbose_json",
-            timestamp_granularities=["segment"],
-        )
+        create_kwargs["file"] = audio_handle
+        response = client.audio.transcriptions.create(**create_kwargs)
 
     payload = to_dict(response)
-    payload["segments"] = normalize_segments(payload.get("segments", []))
+
+    if is_diarize:
+        payload["segments"] = _normalize_diarize_segments(payload.get("segments", []))
+    else:
+        payload["segments"] = normalize_segments(payload.get("segments", []))
+
     payload["text"] = str(payload.get("text") or "").strip()
     return payload
 
@@ -275,6 +328,7 @@ def transcribe_openai(
     chunk_duration: int,
     chunks_root: Path,
 ) -> list[dict[str, Any]]:
+    is_diarize = _is_diarize_model(model)
     size_mb = audio_path.stat().st_size / (1024 * 1024)
     chunk_payloads: list[dict[str, Any]] = []
 
@@ -303,13 +357,15 @@ def transcribe_openai(
             text = str(segment.get("text") or "").strip()
             if not text:
                 continue
-            merged_segments.append(
-                {
-                    "start": max(0.0, start),
-                    "end": max(max(0.0, start), end),
-                    "text": text,
-                }
-            )
+            entry: dict[str, Any] = {
+                "start": max(0.0, start),
+                "end": max(max(0.0, start), end),
+                "text": text,
+            }
+            # Preserve speaker labels from diarize model
+            if is_diarize and "speaker" in segment:
+                entry["speaker"] = str(segment["speaker"])
+            merged_segments.append(entry)
     return merged_segments
 
 
@@ -582,15 +638,31 @@ def process_video(
             chunks_root=output_dir / "_chunks" / video_id,
         )
 
-    diarization_segments: list[tuple[float, float, str]] = []
-    diarization_used = False
-    if diarization_enabled:
-        diarization_segments = diarize(audio_file)
-        diarization_used = bool(diarization_segments)
-        if not diarization_used:
-            LOGGER.info("Diarization unavailable for %s; using single-speaker fallback.", video_id)
+    # If using the diarize model, segments already have speaker labels — skip pyannote
+    api_diarized = engine == "openai" and _is_diarize_model(model) and any(
+        "speaker" in s for s in whisper_segments
+    )
 
-    segments = merge_diarization(whisper_segments, diarization_segments)
+    if api_diarized:
+        LOGGER.info("Using API-provided speaker diarization for %s", video_id)
+        diarization_used = True
+        # Add minute_mark and default speaker where missing
+        segments: list[dict[str, Any]] = []
+        for seg in whisper_segments:
+            start = float(seg.get("start", 0.0))
+            seg.setdefault("speaker", "Speaker 1")
+            seg["minute_mark"] = minute_mark_from_start(start)
+            segments.append(seg)
+    else:
+        diarization_segments: list[tuple[float, float, str]] = []
+        diarization_used = False
+        if diarization_enabled:
+            diarization_segments = diarize(audio_file)
+            diarization_used = bool(diarization_segments)
+            if not diarization_used:
+                LOGGER.info("Diarization unavailable for %s; using single-speaker fallback.", video_id)
+
+        segments = merge_diarization(whisper_segments, diarization_segments)
     payload = build_transcript_payload(
         metadata=metadata,
         video_id=video_id,
